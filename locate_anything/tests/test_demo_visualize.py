@@ -20,105 +20,31 @@ Run (chip 2, no cross-chip fabric):
     python -m pytest -svq locate_anything/tests/test_demo_visualize.py
 """
 import os
-import re
 import time
 
 import pytest
 import torch
 from loguru import logger
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 import ttnn
 from models.demos.qwen25_vl.tt.common import merge_vision_tokens, preprocess_inputs_prefill
 from locate_anything.reference import la_inputs
-from locate_anything.tests.bench_locate_anything import create_tt_model, create_tt_page_table
 from locate_anything.tt.vision import MoonViT
 from models.tt_transformers.tt.common import Mode, sample_host
 from models.tt_transformers.tt.generator import Generator as TTTGenerator
 from models.tt_transformers.tt.model_config import DecodersPrecision
 
-EOS_TOKEN_ID = 151645
-PAGE_PARAMS = {"page_block_size": 32, "page_max_num_blocks": 1024}
-
-_BOX_RE = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
-_POINT_RE = re.compile(r"<box><(\d+)><(\d+)></box>")
-_REF_RE = re.compile(r"<ref>(.*?)</ref>")
-# token-aware iterator: a <ref>label</ref> OR a 4-coord box OR a 2-coord point
-_ITEM_RE = re.compile(
-    r"<ref>(?P<ref>.*?)</ref>|<box><(?P<x1>\d+)><(?P<y1>\d+)><(?P<x2>\d+)><(?P<y2>\d+)></box>|<box><(?P<px>\d+)><(?P<py>\d+)></box>"
+# Parsing/drawing helpers and the model-construction recipe live in locate_anything/tt/pipeline.py
+# (shared with the server); imported back here so this demo stays the reference for them.
+from locate_anything.tt.pipeline import (  # noqa: E402
+    EOS_TOKEN_ID,
+    PAGE_PARAMS,
+    create_tt_model,
+    create_tt_page_table,
+    parse_detections,
+    visualize,
 )
-
-_PALETTE = [
-    (255, 64, 64),
-    (64, 200, 64),
-    (64, 128, 255),
-    (255, 180, 0),
-    (200, 64, 255),
-    (0, 200, 200),
-    (255, 100, 180),
-    (140, 220, 60),
-]
-
-
-def parse_detections(answer: str, W: int, H: int):
-    """Walk the answer in order, attaching each box/point to the current <ref> label."""
-    dets = []
-    cur_label = None
-    for m in _ITEM_RE.finditer(answer):
-        if m.group("ref") is not None:
-            cur_label = m.group("ref").strip()
-        elif m.group("x1") is not None:
-            x1, y1, x2, y2 = (int(m.group(k)) for k in ("x1", "y1", "x2", "y2"))
-            dets.append(
-                {
-                    "label": cur_label,
-                    "box": (x1 / 1000 * W, y1 / 1000 * H, x2 / 1000 * W, y2 / 1000 * H),
-                }
-            )
-        elif m.group("px") is not None:
-            px, py = int(m.group("px")), int(m.group("py"))
-            dets.append({"label": cur_label, "point": (px / 1000 * W, py / 1000 * H)})
-    return dets
-
-
-def _font(size):
-    for p in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
-
-
-def visualize(image: Image.Image, dets, out_path: str):
-    img = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(img)
-    W, H = img.size
-    lw = max(2, round(min(W, H) / 300))
-    font = _font(max(14, round(min(W, H) / 45)))
-    labels = sorted({d.get("label") or "obj" for d in dets})
-    color_of = {lab: _PALETTE[i % len(_PALETTE)] for i, lab in enumerate(labels)}
-    for d in dets:
-        col = color_of.get(d.get("label") or "obj")
-        lab = d.get("label") or ""
-        if "box" in d:
-            x1, y1, x2, y2 = d["box"]
-            draw.rectangle([x1, y1, x2, y2], outline=col, width=lw)
-            if lab:
-                tb = draw.textbbox((0, 0), lab, font=font)
-                tw, th = tb[2] - tb[0], tb[3] - tb[1]
-                ty = max(0, y1 - th - 4)
-                draw.rectangle([x1, ty, x1 + tw + 6, ty + th + 4], fill=col)
-                draw.text((x1 + 3, ty + 2), lab, fill=(255, 255, 255), font=font)
-        elif "point" in d:
-            px, py = d["point"]
-            r = lw * 3
-            draw.ellipse([px - r, py - r, px + r, py + r], outline=col, width=lw)
-            if lab:
-                draw.text((px + r + 2, py - r), lab, fill=col, font=font)
-    img.save(out_path)
-    return out_path
 
 
 @pytest.mark.parametrize(

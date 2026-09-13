@@ -24,6 +24,33 @@ RoPE gotcha (validated against torch apply_rope at PCC 1.0, and on-device at 0.9
   pairs), which is EXACTLY what ttnn.experimental.rotary_embedding_llama implements
   given cos/sin built as repeat_interleave of Re/Im(freqs_cis). head_dim 72 is padded
   to 96 with cos=1, sin=0 so the padded lanes are an identity rotation.
+
+Two execution paths, selected ONCE at construction (``fused`` / env ``TT_FUSED``, see
+``locate_anything/tt/fused.py``):
+
+* legacy (``TT_FUSED=0``): the 2026-09-12 shipped graph, bit-for-bit -- 386 eager ops on a
+  128-padded sequence with an explicit SDPA padding mask, ``ttnn.linear`` everywhere, host
+  ``patch_merger`` between the encoder readback and the mlp1 upload, host tilize of the pixels.
+* fused (default since the 2026-09-13 device validation, ``TT_FUSED`` unset or ``1``): the rf-detr
+  pattern library applied to the same math. The DEFAULT sub-knobs keep the legacy vision numerics
+  bit for bit (device-verified ``torch.equal`` on the projector output) and add only the exact levers:
+  A. the WHOLE graph (tilize -> patch-embed -> 27 blocks -> final LN -> merge -> mlp1) is one
+     metal trace with a persistent device input (``capture_trace`` / ``forward_device``);
+  B. the patch merger runs on device as four 0/1 permutation matmuls + one concat (exact);
+  J. ROW_MAJOR pixel upload + in-graph ``tilize_with_zero_padding`` (no host tilize).
+  Measured opt-ins that change the bf16 rounding (see DEVICE_VALIDATION.md "Results"):
+  C. ``LA_FUSED_EXACT_SEQ=1``: a tile-aligned L (served 24x44 -> 1056 = 33 tiles) is not padded
+     and the SDPA gets NO attention mask (the kernel masks nothing because nothing is padded);
+  F. ``LA_FUSED_SDPA_CHUNKS=96,352 LA_FUSED_SDPA_EXP_APPROX=0``: SDPAProgramConfig chunks + exact exp
+     (the default ``32,32`` + approx exp is what the legacy call gets without a program config);
+  D/E. ``LA_FUSED_MATMUL=minimal``: ``dit_minimal_matmul_addcmul_fused`` folds the residual add into
+     wo / fc1 / patch-embed (+pos_emb), ``minimal_matmul`` replaces ``ttnn.linear`` for wqkv / fc0 /
+     mlp1 (full-logits PCC below the 0.99 gate on the port golden -> not default);
+  H/I. ``LA_FUSED_GELU=tanh`` (the reference's variant; lower PCC on device), ``LA_FUSED_L1=1``
+     (working set in L1; changes ``ttnn.linear`` numerics on the padded graph, below gate).
+  Every fused op keeps the port's HiFi4 + fp32-accumulate compute config; the permutation
+  matmuls use HiFi4 without fp32 accumulation (exact for 0/1 x bf16, as verified on device by
+  the rf-detr port).
 """
 
 import glob
@@ -35,6 +62,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 
 import ttnn
+from locate_anything.tt.fused import FusedConfig, build_merge_perms, patch_merge_host, vision_seq_pad
 
 HIDDEN = 1152
 N_LAYERS = 27
@@ -49,6 +77,8 @@ THETA_BASE = 10000.0
 POS_EMB_HW = 64
 MLP1_IN = HIDDEN * MERGE[0] * MERGE[1]  # 4608
 PROJ_OUT = 2048
+PATCH_DIM = 3 * PATCH * PATCH  # 588 flattened (c, kh, kw) pixels per patch
+PATCH_DIM_PAD = 608  # tile-aligned width the ROW_MAJOR upload is zero-padded to (fused path J)
 
 
 def _load_vision_state_dict(model_path):
@@ -133,15 +163,49 @@ def _pad_per_head(t_2d_or_1d, n_heads, head_dim, pad_head_dim):
         return t.reshape(-1)
 
 
-class MoonViT:
-    """TT-NN MoonViT vision tower + mlp1 projector for a single image on one device."""
+def build_attn_mask(L, seq_pad):
+    """Legacy additive SDPA mask over the padded sequence (only when seq_pad > L): real tokens
+    attend to all real tokens and never to padding columns; padding rows attend to themselves only
+    (keeps their softmax finite). fp32 [1,1,seq_pad,seq_pad]."""
+    mask = torch.zeros(1, 1, seq_pad, seq_pad, dtype=torch.float32)
+    mask[:, :, :, L:] = float("-inf")  # no token may attend to padding cols
+    mask[:, :, L:, :] = float("-inf")  # padding rows attend to nothing (avoid NaN: keep diag)
+    for i in range(L, seq_pad):
+        mask[0, 0, i, i] = 0.0
+    return mask
 
-    def __init__(self, device, model_path, grid_hw, dtype=ttnn.bfloat16):
+
+class MoonViT:
+    """TT-NN MoonViT vision tower + mlp1 projector for a single image on one device.
+
+    ``fused`` (a :class:`FusedConfig`; ``None`` = read ``TT_FUSED`` from the environment once)
+    selects the legacy or the fused path for the life of the object -- see the module docstring.
+    Public surface used by the pipeline/tests: ``forward`` (host result), ``forward_device`` /
+    ``read_projection`` (device result, fused pipeline), ``capture_trace``, ``patch_merger``,
+    ``L``, ``seq_pad``, ``merged_pad``, ``nmerged``.
+    """
+
+    def __init__(self, device, model_path, grid_hw, dtype=ttnn.bfloat16, fused=None):
         self.device = device
         self.dtype = dtype
         self.grid_hw = (int(grid_hw[0]), int(grid_hw[1]))
         self.L = self.grid_hw[0] * self.grid_hw[1]
         self.scale = HEAD_DIM**-0.5  # NOTE: real head_dim (72), not padded
+        self.fused = fused if fused is not None else FusedConfig.from_env()
+        f = self.fused
+
+        # Row padding (lever C): legacy pads to 128 and masks the padding columns; the fused path
+        # keeps a tile-aligned L exact (no padding, no mask) and otherwise uses the legacy rule.
+        # LA_FUSED_EXACT_SEQ=0 keeps the legacy padding + mask inside the fused graph (A/B: with
+        # linear matmuls and the legacy SDPA config that is the legacy vision numerics, bit for bit).
+        exact_seq = f.enabled and f.exact_seq
+        self.seq_pad = vision_seq_pad(self.L, exact_seq)
+        self.nmerged = self.L // (MERGE[0] * MERGE[1])
+        self.merged_pad = vision_seq_pad(self.nmerged, exact_seq)
+        # Working-set placement (lever I): DRAM interleaved unless LA_FUSED_L1=1. Legacy calls pass
+        # DRAM explicitly where they always did and nothing elsewhere (``self._mc`` is empty).
+        self.mem = ttnn.L1_MEMORY_CONFIG if (f.enabled and f.l1) else ttnn.DRAM_MEMORY_CONFIG
+        self._mc = {"memory_config": self.mem} if f.enabled else {}
 
         # Precision-first: HiFi4 + fp32 dest accumulate on every matmul / SDPA.
         self.ck_hifi4 = ttnn.WormholeComputeKernelConfig(
@@ -162,9 +226,17 @@ class MoonViT:
 
         # --- patch_embed host consts ---
         proj_w, proj_b, pos_emb = build_patch_embed_const(sd, self.grid_hw)
-        self.proj_w = self._to_dev(proj_w)  # [588,1152]
+        self.patch_dim = PATCH_DIM
+        if f.enabled and f.rowmajor_input:
+            # J: the ROW_MAJOR upload is zero-padded to 608 columns and tilized on device; give
+            # the weight matching zero rows (0 * 0 contributes exactly nothing).
+            self.patch_dim = PATCH_DIM_PAD
+            proj_w = F.pad(proj_w, (0, 0, 0, PATCH_DIM_PAD - PATCH_DIM))
+        self.proj_w = self._to_dev(proj_w)  # [588 or 608, 1152]
         self.proj_b = self._to_dev(proj_b.reshape(1, -1))  # [1,1152]
-        self.pos_emb = self._to_dev(pos_emb.reshape(1, 1, self.L, HIDDEN))
+        if f.enabled and self.seq_pad > self.L:
+            pos_emb = F.pad(pos_emb, (0, 0, 0, self.seq_pad - self.L))  # exact zeros, saves the in-graph pad
+        self.pos_emb = self._to_dev(pos_emb.reshape(1, 1, -1, HIDDEN))  # [1,1,L or seq_pad,HIDDEN]
 
         # --- rope cos/sin (always bf16: rotary_embedding_llama requires bf16) ---
         cos, sin = build_rope_cos_sin(self.grid_hw)
@@ -174,15 +246,10 @@ class MoonViT:
         # --- attention mask (single full window over the real L tokens) ---
         # Plain non-causal SDPA + additive mask: real tokens attend to all real tokens
         # (full bidirectional), and never to padding rows. Padding-row outputs are sliced off.
-        self.seq_pad = self._seq_pad(self.L)
+        # With the fused exact sequence (seq_pad == L) there is nothing to mask and the SDPA
+        # runs mask-free (the provided-mask path was numerically wrong on Blackhole in rf-detr).
         if self.seq_pad > self.L:
-            mask = torch.zeros(1, 1, self.seq_pad, self.seq_pad, dtype=torch.float32)
-            mask[:, :, :, self.L :] = float("-inf")  # no token may attend to padding cols
-            mask[:, :, self.L :, :] = float("-inf")  # padding rows attend to nothing (avoid NaN: keep diag)
-            # keep a valid row for padding queries so softmax doesn't produce NaN
-            for i in range(self.L, self.seq_pad):
-                mask[0, 0, i, i] = 0.0
-            self.attn_mask = self._to_dev(mask, dtype=ttnn.bfloat16)
+            self.attn_mask = self._to_dev(build_attn_mask(self.L, self.seq_pad), dtype=ttnn.bfloat16)
         else:
             self.attn_mask = None
         # transformation matrix for the interleaved rotary op (single tile)
@@ -209,6 +276,55 @@ class MoonViT:
         self.mlp1_b1 = self._to_dev(sd["mlp1.1.bias"].reshape(1, -1))
         self.mlp1_w2 = self._to_dev(sd["mlp1.3.weight"].t().contiguous())  # [2048,2048]
         self.mlp1_b2 = self._to_dev(sd["mlp1.3.bias"].reshape(1, -1))
+
+        # --- fused-path constants and program configs ---
+        self._trace_id = None
+        self._persistent_in = None
+        self._trace_out = None
+        if f.enabled:
+            self._init_fused()
+
+    # ------------------------------------------------------------------ #
+    def _init_fused(self):
+        f = self.fused
+        grid = self.device.compute_with_storage_grid_size()
+        q_chunk, k_chunk = f.sdpa_chunks
+        # Lever F is precision-affecting on two counts, both explicit here: the chunk sizes (softmax
+        # rescale boundaries; the legacy call passes no program_config = kernel default 32/32) and
+        # exp_approx_mode (kernel default WITHOUT a program config is True, sdpa_program_factory.cpp
+        # get_exp_approx_mode; the fused default is the exact exp rf-detr ran at no measurable cost).
+        # LA_FUSED_SDPA_CHUNKS=32,32 LA_FUSED_SDPA_EXP_APPROX=1 reproduces the legacy kernel config.
+        self.sdpa_pc = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=grid,
+            q_chunk_size=q_chunk,
+            k_chunk_size=k_chunk,
+            exp_approx_mode=bool(f.sdpa_exp_approx),
+        )
+        m, k, n, sh, sw = f.mm_blocks
+        self.mm_config = ttnn.MinimalMatmulConfig(
+            M_block_size=m, K_block_size=k, N_block_size=n, subblock_h=sh, subblock_w=sw,
+            compute_with_storage_grid_size=grid,
+        )
+        m, k, n, sh, sw = f.dit_blocks
+        self.dit_config = ttnn.MinimalMatmulConfig(
+            M_block_size=m, K_block_size=k, N_block_size=n, subblock_h=sh, subblock_w=sw,
+            compute_with_storage_grid_size=grid,
+        )
+        # Plain residual add through the addcmul: residual + (h @ W + b) * ones. The fused kernel
+        # reads both addcmul inputs through one TensorAccessor type, so the ones vector must live
+        # in the same buffer type as the residual (DRAM constants vs L1 activations under I).
+        self.ones_hidden = self._to_dev(torch.ones(1, 1, 1, HIDDEN))
+        self.ones_hidden_l1 = ttnn.to_memory_config(self.ones_hidden, ttnn.L1_MEMORY_CONFIG) if f.l1 else None
+        # 0/1 permutation matmuls are exact at HiFi4 without fp32 accumulation (one nonzero term
+        # per output; rf-detr verified bit-exact on this device).
+        self.ck_perm = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
+        perms = build_merge_perms(self.grid_hw, self.seq_pad, self.merged_pad, MERGE)
+        self.merge_perms = [self._to_dev(P.reshape(1, 1, self.merged_pad, self.seq_pad)) for P in perms]
 
     def _to_dev(self, t, layout=ttnn.TILE_LAYOUT, dtype=None):
         return ttnn.from_torch(
@@ -259,28 +375,64 @@ class MoonViT:
             "fc1_b": self._to_dev(sd[f"{p}.mlp.fc1.bias"].reshape(1, -1)),
         }
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ op helpers
     def _layer_norm(self, x, w, b):
-        return ttnn.layer_norm(x, epsilon=LN_EPS, weight=w, bias=b, compute_kernel_config=self.ck_hifi4)
+        return ttnn.layer_norm(x, epsilon=LN_EPS, weight=w, bias=b, compute_kernel_config=self.ck_hifi4, **self._mc)
 
-    def _attention(self, x_norm, blk):
-        """x_norm: [1,1,seq_pad,HIDDEN] -> attn output [1,1,seq_pad,HIDDEN]."""
-        # fused qkv
-        xqkv = ttnn.linear(
-            x_norm,
-            blk["wqkv"],
-            bias=blk["wqkv_b"],
+    def _ones_for(self, residual):
+        """Scale vector of the fused addcmul in the residual's buffer type (see _init_fused)."""
+        if residual.memory_config().buffer_type == ttnn.BufferType.L1:
+            return self.ones_hidden_l1
+        return self.ones_hidden
+
+    def _matmul(self, h, w, b):
+        """h @ w + b. Fused path with LA_FUSED_MATMUL=minimal: the minimal_matmul kernel (same
+        HiFi4 + fp32-acc compute config; no fused activation -- slower per the rf-detr precedent)."""
+        if self.fused.enabled and self.fused.matmul == "minimal":
+            return ttnn.experimental.minimal_matmul(
+                h, w, bias_tensor=b, config=self.mm_config, memory_config=self.mem, dtype=self.dtype,
+                compute_kernel_config=self.ck_hifi4,
+            )
+        return ttnn.linear(
+            h,
+            w,
+            bias=b,
             compute_kernel_config=self.ck_hifi4,
             dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )  # [1,1,seq_pad, 3*N_HEADS*PAD_HEAD_DIM]
+            memory_config=self.mem,
+        )
+
+    def _matmul_residual(self, h, w, b, residual):
+        """residual + (h @ w + b): one dit_minimal_matmul_addcmul_fused call (scale = ones) on the
+        fused minimal path, else the legacy linear -> add pair (same operand order)."""
+        if self.fused.enabled and self.fused.matmul == "minimal":
+            return ttnn.experimental.dit_minimal_matmul_addcmul_fused(
+                h, w, 1.0, residual, self._ones_for(residual),
+                bias_tensor=b, config=self.dit_config, memory_config=self.mem, dtype=self.dtype,
+                compute_kernel_config=self.ck_hifi4,
+            )
+        y = self._matmul(h, w, b)
+        out = ttnn.add(residual, y, memory_config=self.mem)
+        ttnn.deallocate(y)
+        return out
+
+    def _gelu(self, h):
+        if self.fused.enabled and self.fused.gelu == "tanh":
+            # The reference (PytorchGELUTanh) variant; ttnn.gelu's default is the erf/Accurate one.
+            return ttnn.gelu(h, variant=ttnn.GeluVariant.Tanh, **self._mc)
+        return ttnn.gelu(h, **self._mc)
+
+    def _attention(self, x_norm, blk):
+        """x_norm: [1,1,seq_pad,HIDDEN] -> concatenated heads [1,1,seq_pad,N_HEADS*PAD_HEAD_DIM]
+        (the wo projection + residual is applied by the caller)."""
+        xqkv = self._matmul(x_norm, blk["wqkv"], blk["wqkv_b"])  # [1,1,seq_pad, 3*N_HEADS*PAD_HEAD_DIM]
 
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             xqkv,
             num_heads=N_HEADS,
             num_kv_heads=N_HEADS,
             transpose_k_heads=False,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            memory_config=self.mem,
         )  # each [1, N_HEADS, seq_pad, PAD_HEAD_DIM]
         ttnn.deallocate(xqkv)
 
@@ -291,12 +443,15 @@ class MoonViT:
         if k.dtype != ttnn.bfloat16:
             k = ttnn.typecast(k, dtype=ttnn.bfloat16)
         q = ttnn.experimental.rotary_embedding_llama(
-            q, self.rope_cos, self.rope_sin, self.rope_trans, is_decode_mode=False
+            q, self.rope_cos, self.rope_sin, self.rope_trans, is_decode_mode=False, **self._mc
         )
         k = ttnn.experimental.rotary_embedding_llama(
-            k, self.rope_cos, self.rope_sin, self.rope_trans, is_decode_mode=False
+            k, self.rope_cos, self.rope_sin, self.rope_trans, is_decode_mode=False, **self._mc
         )
 
+        sdpa_kwargs = dict(self._mc)
+        if self.fused.enabled:
+            sdpa_kwargs["program_config"] = self.sdpa_pc
         attn = ttnn.transformer.scaled_dot_product_attention(
             q,
             k,
@@ -305,66 +460,80 @@ class MoonViT:
             is_causal=False,
             scale=self.scale,
             compute_kernel_config=self.ck_sdpa,
+            **sdpa_kwargs,
         )  # [1, N_HEADS, seq_pad, PAD_HEAD_DIM]
         ttnn.deallocate(q)
         ttnn.deallocate(k)
         ttnn.deallocate(v)
 
-        attn = ttnn.experimental.nlp_concat_heads(attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # [1,1,seq_pad, N_HEADS*PAD_HEAD_DIM]
-        out = ttnn.linear(
-            attn,
-            blk["wo"],
-            bias=blk["wo_b"],
-            compute_kernel_config=self.ck_hifi4,
-            dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        ctx = ttnn.experimental.nlp_concat_heads(attn, memory_config=self.mem)
         ttnn.deallocate(attn)
-        return out
-
-    def _mlp(self, x_norm, blk):
-        h = ttnn.linear(
-            x_norm,
-            blk["fc0_w"],
-            bias=blk["fc0_b"],
-            compute_kernel_config=self.ck_hifi4,
-            dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        h = ttnn.gelu(h)  # tanh-approx GELU (matches PytorchGELUTanh)
-        out = ttnn.linear(
-            h,
-            blk["fc1_w"],
-            bias=blk["fc1_b"],
-            compute_kernel_config=self.ck_hifi4,
-            dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        ttnn.deallocate(h)
-        return out
+        return ctx  # [1,1,seq_pad, N_HEADS*PAD_HEAD_DIM]
 
     def _block(self, x, blk):
         n0 = self._layer_norm(x, blk["norm0_w"], blk["norm0_b"])
-        attn = self._attention(n0, blk)
+        ctx = self._attention(n0, blk)
         ttnn.deallocate(n0)
-        x = ttnn.add(x, attn, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(attn)
+        x = self._matmul_residual(ctx, blk["wo"], blk["wo_b"], x)
+        ttnn.deallocate(ctx)
 
         n1 = self._layer_norm(x, blk["norm1_w"], blk["norm1_b"])
-        mlp = self._mlp(n1, blk)
+        h = self._matmul(n1, blk["fc0_w"], blk["fc0_b"])
         ttnn.deallocate(n1)
-        x = ttnn.add(x, mlp, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(mlp)
+        h = self._gelu(h)  # GELU variant: legacy erf op; LA_FUSED_GELU=tanh for the reference's
+        x = self._matmul_residual(h, blk["fc1_w"], blk["fc1_b"], x)
+        ttnn.deallocate(h)
         return x
 
-    # ------------------------------------------------------------------ #
-    def patch_embed(self, pixel_values):
-        """pixel_values torch [L,3,14,14] -> ttnn [1,1,seq_pad,HIDDEN] (real rows then padding)."""
+    # ------------------------------------------------------------------ input
+    def host_input(self, pixel_values):
+        """Per-image host work: pixel_values torch [L,3,14,14] -> host ttnn tensor to upload.
+
+        Legacy: bf16 TILE [1,1,seq_pad,588] (host tilize). Fused J: bf16 ROW_MAJOR
+        [1,1,seq_pad,608] (zero-padded columns; tilized in-graph). Both convert fp32 -> bf16 with
+        ttnn.from_torch, so the pixel values are bit-identical between the two."""
         L = pixel_values.shape[0]
         assert L == self.L, f"pixel rows {L} != grid L {self.L}"
         pix_flat = pixel_values.float().reshape(L, -1)  # [L,588] C-order (c,kh,kw)
-        seq_pad = self._seq_pad(L)
+        if self.seq_pad > L:
+            pix_flat = F.pad(pix_flat, (0, 0, 0, self.seq_pad - L))
+        if self.fused.enabled and self.fused.rowmajor_input:
+            pix_flat = F.pad(pix_flat, (0, PATCH_DIM_PAD - PATCH_DIM))
+            return ttnn.from_torch(
+                pix_flat.reshape(1, 1, self.seq_pad, PATCH_DIM_PAD), dtype=self.dtype, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
+        return ttnn.from_torch(pix_flat.reshape(1, 1, self.seq_pad, -1), dtype=self.dtype, layout=ttnn.TILE_LAYOUT)
+
+    def _ingest(self, x):
+        """Device input tensor -> TILE [1,1,seq_pad,patch_dim] (in-graph tilize for the ROW_MAJOR upload)."""
+        if x.layout == ttnn.ROW_MAJOR_LAYOUT:
+            return ttnn.tilize_with_zero_padding(x, memory_config=self.mem, use_multicore=True)
+        return x
+
+    def _patch_embed_device(self, x):
+        """Fused path: TILE pixels [1,1,seq_pad,patch_dim] -> [1,1,seq_pad,HIDDEN] = x @ W + b + pos_emb
+        (pos_emb is host-padded to seq_pad, so no in-graph pad; one fused op on the minimal path)."""
+        if self.fused.matmul == "minimal":
+            return ttnn.experimental.dit_minimal_matmul_addcmul_fused(
+                x, self.proj_w, 1.0, self.pos_emb, self._ones_for(self.pos_emb),
+                bias_tensor=self.proj_b, config=self.dit_config, memory_config=self.mem, dtype=self.dtype,
+                compute_kernel_config=self.ck_hifi4,
+            )
+        y = self._matmul(x, self.proj_w, self.proj_b)
+        out = ttnn.add(y, self.pos_emb, memory_config=self.mem)
+        ttnn.deallocate(y)
+        return out
+
+    def patch_embed(self, pixel_values):
+        """pixel_values torch [L,3,14,14] -> ttnn [1,1,seq_pad,HIDDEN] (real rows then padding)."""
+        if self.fused.enabled:
+            x = ttnn.to_device(self.host_input(pixel_values), self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            return self._patch_embed_device(self._ingest(x))
+        # legacy (shipped) path, unchanged: host tilize + upload, linear, in-graph pad of pos_emb, add
+        L = pixel_values.shape[0]
+        assert L == self.L, f"pixel rows {L} != grid L {self.L}"
+        pix_flat = pixel_values.float().reshape(L, -1)  # [L,588] C-order (c,kh,kw)
+        seq_pad = self.seq_pad
         if seq_pad > L:
             pix_flat = F.pad(pix_flat, (0, 0, 0, seq_pad - L))
         x = self._to_dev(pix_flat.reshape(1, 1, seq_pad, -1))  # [1,1,seq_pad,588]
@@ -386,6 +555,7 @@ class MoonViT:
 
     @staticmethod
     def _seq_pad(L):
+        """Legacy padding rule (kept for callers); the instance rule is ``self.seq_pad``."""
         return int(math.ceil(L / 128) * 128)
 
     def encoder(self, x):
@@ -397,49 +567,165 @@ class MoonViT:
     def patch_merger(self, x_torch):
         """Host-side 2x2 spatial merge (matches modeling_vit.patch_merger), returns [L/4, 4608].
 
-        Done on host between encoder and mlp1 because the merge permute over the (h,w)
-        grid is a pure layout reshuffle; doing it on host keeps the device path exact
-        and avoids a tilized reshape hang. (Inference-time host work limited to a reshape.)
+        The legacy path runs it on host between the encoder readback and the mlp1 upload (a pure
+        layout reshuffle); the fused path reproduces it on device with ``_merge_device``.
         """
-        h, w = self.grid_hw
-        kh, kw = MERGE
-        nh, nw = h // kh, w // kw
-        seq = x_torch[: self.L].reshape(nh, kh, nw, kw, HIDDEN)
-        seq = seq.permute(0, 2, 1, 3, 4).contiguous().reshape(nh * nw, kh * kw * HIDDEN)
-        return seq  # [L/4, 4608]
+        return patch_merge_host(x_torch, self.grid_hw, MERGE)  # [L/4, 4608]
+
+    def _merge_device(self, x):
+        """Encoder output [1,1,seq_pad,HIDDEN] -> merged [1,1,merged_pad,4608] on device: four
+        0/1 permutation matmuls (exact row gathers, rows >= L/4 exactly zero) + one concat."""
+        parts = [
+            ttnn.matmul(P, x, compute_kernel_config=self.ck_perm, memory_config=self.mem) for P in self.merge_perms
+        ]
+        merged = ttnn.concat(parts, dim=-1, memory_config=self.mem)
+        for p in parts:
+            ttnn.deallocate(p)
+        return merged
 
     def mlp1(self, x):
         """x ttnn [1,1,Nmerged,4608] -> [1,1,Nmerged,2048]."""
         x = ttnn.layer_norm(
-            x, epsilon=LN_EPS, weight=self.mlp1_ln_w, bias=self.mlp1_ln_b, compute_kernel_config=self.ck_hifi4
+            x, epsilon=LN_EPS, weight=self.mlp1_ln_w, bias=self.mlp1_ln_b, compute_kernel_config=self.ck_hifi4,
+            **self._mc,
         )
-        x = ttnn.linear(
-            x,
-            self.mlp1_w1,
-            bias=self.mlp1_b1,
-            compute_kernel_config=self.ck_hifi4,
-            dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        x = ttnn.gelu(x)
-        x = ttnn.linear(
-            x,
-            self.mlp1_w2,
-            bias=self.mlp1_b2,
-            compute_kernel_config=self.ck_hifi4,
-            dtype=self.dtype,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        x = self._matmul(x, self.mlp1_w1, self.mlp1_b1)
+        x = self._gelu(x)
+        x = self._matmul(x, self.mlp1_w2, self.mlp1_b2)
         return x
+
+    # ------------------------------------------------------------------ fused device graph + trace
+    def _device_graph(self, x_dev):
+        """Whole fused graph, device in / device out: [1,1,seq_pad,patch_dim] (TILE or ROW_MAJOR)
+        -> vit_proj [1,1,merged_pad,PROJ_OUT]. No host round trip, so it is trace-capturable."""
+        x = self._patch_embed_device(self._ingest(x_dev))
+        x = self.encoder(x)
+        merged = self._merge_device(x)
+        ttnn.deallocate(x)
+        proj = self.mlp1(merged)
+        ttnn.deallocate(merged)
+        if self.fused.l1:
+            # The LLM boundary concatenates this with a DRAM embedding gather: keep the handoff in DRAM.
+            proj_dram = ttnn.to_memory_config(proj, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(proj)
+            proj = proj_dram
+        return proj
+
+    @property
+    def trace_captured(self):
+        return self._trace_id is not None
+
+    @property
+    def trace_output(self):
+        """Persistent device output of the captured vision trace (None before capture)."""
+        return self._trace_out
+
+    def capture_trace(self, pixel_values):
+        """Fused path: allocate the persistent input, run the graph once eagerly (program cache),
+        then record it as ONE metal trace (rf-detr ``_capture_trace``). Call this from the
+        warm-up AFTER every other long-lived device buffer exists (the LLM's decode-trace inputs
+        included): buffers allocated after a capture can land in that trace's scratch.
+
+        The converse hazard is NOT avoided, only ordered around: ``_persistent_in`` and
+        ``_trace_out`` are themselves allocated after the library's decode(+sampling) trace was
+        captured in warm-up run 1, so they may sit in the decode trace's scratch and be clobbered
+        by every decode replay. This is benign only because each request runs
+        copy -> vision trace -> prefill trace -> eager tail -> decode, i.e. both buffers are fully
+        rewritten before anything reads them again. Do not read ``trace_output`` (or replay the
+        prefill trace) after a decode step without re-running the vision trace first."""
+        if not (self.fused.enabled and self.fused.vision_trace):
+            raise RuntimeError("capture_trace needs TT_FUSED=1 with LA_FUSED_VISION_TRACE=1")
+        if self._trace_id is not None:
+            return
+        host = self.host_input(pixel_values)
+        self._persistent_in = ttnn.to_device(host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        out = self._device_graph(self._persistent_in)  # compile pass
+        ttnn.synchronize_device(self.device)
+        ttnn.deallocate(out)
+        trace_id = ttnn.begin_trace_capture(self.device, cq_id=0)
+        try:
+            out = self._device_graph(self._persistent_in)
+        except BaseException:
+            # Never leave a capture open: an open capture hangs the device close (p150 lesson).
+            try:
+                ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
+                ttnn.release_trace(self.device, trace_id)
+            except Exception as e:  # noqa: BLE001
+                print(f"[vision] closing the failed trace capture raised: {e!r}", flush=True)
+            raise
+        ttnn.end_trace_capture(self.device, trace_id, cq_id=0)
+        ttnn.synchronize_device(self.device)
+        self._trace_id = trace_id
+        self._trace_out = out
+
+    def release_trace(self):
+        """Release the captured vision trace and its persistent buffers (trace-region hygiene for
+        sessions that build several MoonViT instances on one device, e.g. DEVICE_VALIDATION 3.3).
+        The next ``forward_device`` runs eagerly until ``capture_trace`` is called again."""
+        if self._trace_id is not None:
+            ttnn.release_trace(self.device, self._trace_id)
+            self._trace_id = None
+        for attr in ("_trace_out", "_persistent_in"):
+            t = getattr(self, attr)
+            if t is not None:
+                ttnn.deallocate(t)
+                setattr(self, attr, None)
+
+    def forward_device(self, pixel_values):
+        """pixel_values torch [L,3,14,14] -> vit_proj ttnn DEVICE tensor [1,1,merged_pad,PROJ_OUT]
+        (rows >= nmerged are padding). Trace replay when captured (the returned tensor is the
+        persistent trace output: do NOT deallocate it), else the eager fused graph (caller owns
+        the result). Fused path only; legacy callers use ``forward``."""
+        assert self.fused.enabled, "forward_device is the fused path; use forward() on the legacy path"
+        host = self.host_input(pixel_values)
+        if self._trace_id is not None:
+            ttnn.copy_host_to_device_tensor(host, self._persistent_in, cq_id=0)
+            ttnn.execute_trace(self.device, self._trace_id, cq_id=0, blocking=False)
+            return self._trace_out
+        x = ttnn.to_device(host, self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return self._device_graph(x)
+
+    def read_projection(self, proj_dev):
+        """Device vit_proj [1,1,merged_pad,PROJ_OUT] -> host fp32 [nmerged, PROJ_OUT] (one readback)."""
+        return ttnn.to_torch(proj_dev)[0, 0, : self.nmerged].float()
 
     # ------------------------------------------------------------------ #
     def forward(self, pixel_values, return_intermediates=False):
-        """pixel_values torch [L,3,14,14] -> vit_proj ttnn [Nmerged, 2048].
+        """pixel_values torch [L,3,14,14] -> vit_proj torch fp32 [Nmerged, 2048] on host.
 
-        If return_intermediates, also return dict of host tensors for incremental PCC.
+        If return_intermediates, also return dict of host tensors for incremental PCC
+        (always eager, so test_vision.py can read the encoder output back).
         """
+        if self.fused.enabled:
+            return self._forward_fused(pixel_values, return_intermediates)
+        return self._forward_legacy(pixel_values, return_intermediates)
+
+    def _forward_fused(self, pixel_values, return_intermediates):
+        if not return_intermediates:
+            proj = self.forward_device(pixel_values)
+            proj_torch = self.read_projection(proj)
+            if self._trace_id is None:
+                ttnn.deallocate(proj)
+            return proj_torch
         L = self.L
-        seq_pad = self._seq_pad(L)
+        x = ttnn.to_device(self.host_input(pixel_values), self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        x = self._patch_embed_device(self._ingest(x))
+        inter = {"patch_embed": ttnn.to_torch(x)[0, 0, :L].float()}
+        x = self.encoder(x)
+        inter["encoder_out"] = ttnn.to_torch(x)[0, 0, :L].float()
+        merged = self._merge_device(x)
+        ttnn.deallocate(x)
+        inter["merged"] = ttnn.to_torch(merged)[0, 0, : self.nmerged].float()
+        proj = self.mlp1(merged)
+        ttnn.deallocate(merged)
+        proj_torch = self.read_projection(proj)
+        ttnn.deallocate(proj)
+        return proj_torch, inter
+
+    def _forward_legacy(self, pixel_values, return_intermediates):
+        """The shipped path, op for op: eager graph, host patch_merger between two readbacks."""
+        L = self.L
+        seq_pad = self.seq_pad
 
         x = self.patch_embed(pixel_values)  # [1,1,seq_pad,HIDDEN]
         inter = {}
@@ -454,7 +740,7 @@ class MoonViT:
 
         merged = self.patch_merger(enc_torch)  # [L/4, 4608]
         nmerged = merged.shape[0]
-        merged_pad = self._seq_pad(nmerged)
+        merged_pad = self.merged_pad
         if merged_pad > nmerged:
             merged = F.pad(merged, (0, 0, 0, merged_pad - nmerged))
         xm = self._to_dev(merged.reshape(1, 1, merged_pad, MLP1_IN))

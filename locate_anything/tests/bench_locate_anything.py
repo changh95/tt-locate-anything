@@ -25,117 +25,29 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_allclose, comp_pcc
-from models.demos.qwen25_vl.tt.common import PagedAttentionConfig, merge_vision_tokens, preprocess_inputs_prefill
+from models.demos.qwen25_vl.tt.common import merge_vision_tokens, preprocess_inputs_prefill
 from locate_anything.reference import la_inputs
-from locate_anything.tt.model_la import LATransformer
 from locate_anything.tt.vision import MoonViT
 from models.tt_transformers.tt.common import Mode, sample_host
 from models.tt_transformers.tt.generator import Generator as TTTGenerator
-from models.tt_transformers.tt.model_config import (
-    DecodersPrecision,
-    MathFidelitySetting,
-    ModelArgs,
-    ModelOptimizations,
-    OpGroup,
+
+
+# Model-construction helpers live in locate_anything/tt/pipeline.py (shared with the server);
+# they are re-exported here so the demos/tests keep importing them from this module.
+from locate_anything.tt.pipeline import (  # noqa: E402
+    EOS_TOKEN_ID,
+    IMAGE_TOKEN_INDEX,
+    PAGE_PARAMS,
+    _select_optimizations,
+    create_tt_model,
+    create_tt_page_table,
 )
-
-
-def _select_optimizations(model_args):
-    """LA_PREC selects the decoder precision preset (all keep BFP8 MLP for >=99% PCC):
-    accuracy  (default): BF16 attention (WQKV/WO/KV) + HiFi4  -> highest accuracy
-    bfp8attn:            all-BFP8 weights + KV  + HiFi4 attn  -> less bandwidth, faster
-    """
-    prec = os.environ.get("LA_PREC", "accuracy")
-    if prec == "bfp8attn":
-        hifi4 = MathFidelitySetting.HIFI4
-        mo = ModelOptimizations(
-            {
-                "OpFidelity": {
-                    OpGroup.LI_QKV_DECODE: hifi4,
-                    OpGroup.LI_QKV_PREFILL: hifi4,
-                    OpGroup.SDPA_DECODE: hifi4,
-                    OpGroup.SDPA_PREFILL: hifi4,
-                    OpGroup.LI_O_DECODE: hifi4,
-                    OpGroup.LI_O_PREFILL: hifi4,
-                }
-            }
-        )
-        return DecodersPrecision(model_args.n_layers, model_args.model_name, mo)
-    return DecodersPrecision.accuracy(model_args.n_layers, model_args.model_name)
-
-
-# LocateAnything special token ids (from the extracted HF config).
-IMAGE_TOKEN_INDEX = 151665
-EOS_TOKEN_ID = 151645
 
 # Reference golden bundle produced on torch CPU (locate_anything/reference/run_reference.py).
 # Resolved relative to this file so the benchmark works from any CWD; override with LA_GOLDEN.
 GOLDEN_PATH = os.environ.get(
     "LA_GOLDEN", os.path.join(os.path.dirname(__file__), "..", "reference", "golden.pt")
 )
-
-# Paged-attention page params (block_size * max_num_blocks must cover max_seq_len).
-PAGE_PARAMS = {"page_block_size": 32, "page_max_num_blocks": 1024}
-
-
-def create_tt_page_table(paged_attention_config, tt_model_args):
-    """Random (shuffled) virtual->physical block mapping. Copied from qwen25_vl demo."""
-    if paged_attention_config is None:
-        return None
-    permutation = torch.randperm(paged_attention_config.max_num_blocks)
-    reverse_permutation = torch.argsort(permutation)
-    return reverse_permutation.reshape(
-        tt_model_args.max_batch_size,
-        paged_attention_config.max_num_blocks // tt_model_args.max_batch_size,
-    )
-
-
-def create_tt_model(
-    mesh_device,
-    instruct,
-    max_batch_size,
-    optimizations,
-    max_seq_len,
-    page_params,
-    dtype=ttnn.bfloat8_b,
-    use_paged_kv_cache=True,
-):
-    """Build LATransformer + paged KV cache. Adapted from qwen25_vl demo create_tt_model."""
-    tt_model_args = ModelArgs(
-        mesh_device,
-        instruct=instruct,
-        max_batch_size=max_batch_size,
-        optimizations=optimizations,
-        max_seq_len=max_seq_len,
-        cache_hf=True,
-    )
-    state_dict = tt_model_args.load_state_dict()
-
-    paged_attention_config = (
-        PagedAttentionConfig(
-            block_size=page_params["page_block_size"],
-            max_num_blocks=page_params["page_max_num_blocks"],
-        )
-        if use_paged_kv_cache
-        else None
-    )
-
-    # NOTE: do NOT pass use_paged_kv_cache=True. The stock Attention only calls
-    # init_kv_cache() (which allocates `layer_past`) when use_paged_kv_cache is
-    # False; the paged vs non-paged *shape* is selected by paged_attention_config.
-    # This matches models/tt_transformers/tt/common.py:create_tt_model.
-    model = LATransformer(
-        args=tt_model_args,
-        mesh_device=mesh_device,
-        dtype=dtype,
-        state_dict=state_dict,
-        weight_cache_path=tt_model_args.weight_cache_path(dtype),
-        paged_attention_config=paged_attention_config,
-    )
-
-    tt_kv_cache = [l.attention.layer_past for l in model.layers] if paged_attention_config else None
-
-    return tt_model_args, model, paged_attention_config, tt_kv_cache
 
 
 def _peak_dram_bytes(mesh_device):
