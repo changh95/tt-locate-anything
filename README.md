@@ -444,6 +444,22 @@ lookup, vision↔text merge and argmax over a 32×vocab logits readback on host.
 
 ---
 
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+vision + prefill + 10-token decode, 1920×1080 + `car`; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, fused traces (vision 1.6 + prefill 86.3 + decode 202.3 ms, 44.5 tok/s) | 290 | — |
+| RTX 5090 fp32 strict (HF transformers) | 216 | GPU 1.3× (vision+prefill 92 ms: p150a faster) |
+| RTX 5090 bf16 autocast over fp32 weights | 218 | GPU 1.3× |
+| RTX 5090 bf16 native weights (eager, 83 tok/s) | 158 | GPU 1.8× |
+| RTX 5090 bf16 native + `torch.compile` (no CUDA graphs) | 137 | GPU 2.1× |
+
+On vision + prefill the p150a is slightly faster than fp32-strict GPU (88 vs 92 ms); the gap is in decode (44.5 vs 83 tok/s).
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
+
 ## License
 
 Apache 2.0 (matches upstream LocateAnything, Qwen2.5, MoonViT/Kimi-VL, and tt-metal).
